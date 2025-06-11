@@ -3,14 +3,15 @@ name: X86_64 OpenWrt
 on:
   workflow_dispatch:
   schedule:
-    # 如果希望上海时间 19:00 运行，需 UTC 11:00；如不在意，可保留此项或删除。
+    # 如果希望上海时间 19:00 运行，需 UTC 11:00；如不在意，可自行删除或修改
     - cron: '0 11 * * *'
 
 env:
   REPO_URL: https://github.com/coolsnowwolf/lede.git
   REPO_BRANCH: master
   CONFIG_FILE: configs/x86_64.config
-  DIY_SCRIPT: scripts/diy-script.sh
+  # DIY脚本在仓库根目录
+  DIY_SCRIPT: diy-script.sh
   CLASH_KERNEL: amd64
   CACHE_TOOLCHAIN: true
   UPLOAD_BIN_DIR: false
@@ -43,7 +44,6 @@ jobs:
       env:
         DEBIAN_FRONTEND: noninteractive
       run: |
-        # 以下清理及安装依赖命令请根据实际需要谨慎使用
         docker rmi $(docker images -q) || true
         sudo rm -rf /usr/share/dotnet /etc/apt/sources.list.d /usr/local/lib/android $AGENT_TOOLSDIRECTORY || true
         sudo -E apt-get -y purge azure-cli ghc* zulu* llvm* firefox google* dotnet* powershell openjdk* mongodb* moby* || true
@@ -80,11 +80,16 @@ jobs:
 
     - name: Generate Variables
       run: |
-        # 复制 config，使用绝对路径防止找不到
-        cp $GITHUB_WORKSPACE/${CONFIG_FILE} $OPENWRT_PATH/.config
+        # 复制 config，使用绝对路径
+        if [ -f "$GITHUB_WORKSPACE/${CONFIG_FILE}" ]; then
+          cp "$GITHUB_WORKSPACE/${CONFIG_FILE}" "$OPENWRT_PATH/.config"
+        else
+          echo "Error: CONFIG_FILE not found at $GITHUB_WORKSPACE/${CONFIG_FILE}"
+          exit 1
+        fi
         cd $OPENWRT_PATH
         make defconfig > /dev/null 2>&1
-        # 提取 SOURCE_REPO（去掉 .git 后缀）
+        # 提取 SOURCE_REPO
         SOURCE_REPO=$(basename -s .git $REPO_URL)
         echo "SOURCE_REPO=$SOURCE_REPO" >> $GITHUB_ENV
         # 提取 DEVICE_TARGET / DEVICE_SUBTARGET
@@ -110,24 +115,42 @@ jobs:
     - name: Load Custom Configuration
       run: |
         # 如果有 files 目录，移动到 openwrt/files
-        [ -e files ] && mv files $OPENWRT_PATH/files
-        # 复制 config（再次确认）
-        [ -e $GITHUB_WORKSPACE/${CONFIG_FILE} ] && cp $GITHUB_WORKSPACE/${CONFIG_FILE} $OPENWRT_PATH/.config
-        chmod +x $GITHUB_WORKSPACE/scripts/*.sh || true
-        chmod +x $GITHUB_WORKSPACE/${DIY_SCRIPT} || true
-        cd $OPENWRT_PATH
-        # 执行自定义脚本
-        bash $GITHUB_WORKSPACE/${DIY_SCRIPT}
-        bash $GITHUB_WORKSPACE/scripts/preset-clash-core.sh $CLASH_KERNEL
-        bash $GITHUB_WORKSPACE/scripts/preset-terminal-tools.sh
-        bash $GITHUB_WORKSPACE/scripts/preset-adguard-core.sh $CLASH_KERNEL
+        if [ -d "$GITHUB_WORKSPACE/files" ]; then
+          mv "$GITHUB_WORKSPACE/files" "$OPENWRT_PATH/files"
+        fi
+
+        # 复制 config（再确认一次）
+        if [ -f "$GITHUB_WORKSPACE/${CONFIG_FILE}" ]; then
+          cp "$GITHUB_WORKSPACE/${CONFIG_FILE}" "$OPENWRT_PATH/.config"
+        else
+          echo "Error: CONFIG_FILE not found at $GITHUB_WORKSPACE/${CONFIG_FILE}"
+          exit 1
+        fi
+
+        # 执行根目录下 diy-script.sh
+        DIY_PATH="$GITHUB_WORKSPACE/${DIY_SCRIPT}"
+        if [ -f "$DIY_PATH" ]; then
+          chmod +x "$DIY_PATH"
+          bash "$DIY_PATH"
+        else
+          echo "Warning: diy-script.sh not found at $DIY_PATH, skipping."
+        fi
+
+        # 执行 scripts/ 目录下其他 preset 脚本（如存在）
+        for script in preset-clash-core.sh preset-terminal-tools.sh preset-adguard-core.sh; do
+          SCRIPT_PATH="$GITHUB_WORKSPACE/scripts/$script"
+          if [ -f "$SCRIPT_PATH" ]; then
+            bash "$SCRIPT_PATH" $CLASH_KERNEL
+          else
+            echo "Warning: $script not found at $SCRIPT_PATH, skipping."
+          fi
+        done
 
     - name: Download DL Package
       run: |
         cd $OPENWRT_PATH
         make defconfig
         make download -j$(nproc) || true
-        # 清理极小文件，避免占用空间
         find dl -size -1024c -exec rm -f {} \; || true
 
     - name: Compile Firmware
@@ -153,7 +176,6 @@ jobs:
         name: ${{ env.SOURCE_REPO }}-bin-${{ env.DEVICE_TARGET }}-${{ env.DEVICE_SUBTARGET }}-${{ env.FILE_DATE }}
         path: ${{ env.OPENWRT_PATH }}/bin
 
-    # ====== 替换 Organize Files，改为只处理并上传固件镜像 ======
     - name: Collect Firmware Info
       if: steps.compile.outputs.status == 'success'
       run: |
@@ -161,7 +183,6 @@ jobs:
         echo "当前工作目录: $(pwd)"
         echo "列出固件镜像文件："
         ls *.img *.bin *.efi *.img.gz || echo "未找到常见固件，请检查路径和后缀"
-        # 记录 kernel 版本（如需要）
         if ls *.manifest 1> /dev/null 2>&1; then
           KVER=$(cat *.manifest | grep ^kernel | cut -d- -f2 | tr -d ' ')
         else
